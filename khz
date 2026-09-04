@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+import os, sys, glob, json, time, signal, subprocess, urllib.request
+
+HOME = "/home/a"
+LLAMA = HOME + "/.local/bin/llama"
+MODELS = HOME + "/models"
+STATE = HOME + "/khz"
+REG = STATE + "/models.tsv"
+ORACLE_TPL = HOME + "/oracle/oracle.jinja"
+
+def ensure():
+    os.makedirs(MODELS, exist_ok=True)
+    os.makedirs(STATE, exist_ok=True)
+    if not os.path.exists(REG):
+        open(REG, "w").close()
+
+def rows():
+    ensure()
+    out = []
+    for line in open(REG).read().splitlines():
+        if line.strip() == "":
+            continue
+        p = line.split("\t")
+        while len(p) < 5:
+            p.append("")
+        out.append(p[:5])
+    return out
+
+def write_rows(rs):
+    f = open(REG, "w")
+    for r in rs:
+        f.write("\t".join(r) + "\n")
+    f.close()
+
+def find_row(name):
+    for r in rows():
+        if r[0] == name:
+            return r
+    return None
+
+def health(port):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:" + str(port) + "/health", timeout=2).read()
+        return True
+    except Exception:
+        return False
+
+def models_id(port):
+    try:
+        d = json.load(urllib.request.urlopen("http://127.0.0.1:" + str(port) + "/v1/models", timeout=3))
+        return ",".join([m.get("id", "") for m in d.get("data", [])])
+    except Exception:
+        return ""
+
+def cmd_pull(argv):
+    spec = argv[0]
+    name = argv[1]
+    tpl = "builtin"
+    if len(argv) > 2:
+        tpl = argv[2]
+    rc = subprocess.call([LLAMA, "download", "-hf", spec])
+    if rc != 0:
+        rc = subprocess.call([LLAMA, "download", spec])
+    print("DOWNLOAD_RC", rc)
+    if rc != 0:
+        return 1
+    parts = spec.split(":")[0].split("/")
+    d = HOME + "/.cache/huggingface/hub/models--" + parts[0] + "--" + parts[1]
+    cands = glob.glob(d + "/snapshots/*/*.gguf")
+    if len(cands) == 0:
+        print("NO_GGUF", d)
+        return 1
+    cands.sort(key=lambda p: os.path.getsize(os.path.realpath(p)))
+    src = os.path.realpath(cands[-1])
+    dst = MODELS + "/" + name + ".gguf"
+    if os.path.exists(dst) or os.path.islink(dst):
+        os.remove(dst)
+    try:
+        os.link(src, dst)
+        kind = "hardlink"
+    except OSError:
+        os.symlink(src, dst)
+        kind = "symlink"
+    rs = [r for r in rows() if r[0] != name]
+    rs.append([name, dst, tpl, spec, str(os.path.getsize(src))])
+    write_rows(rs)
+    print("REGISTERED", name, kind, os.path.getsize(src))
+    return 0
+
+def cmd_run(argv):
+    name = argv[0]
+    port = "8080"
+    if len(argv) > 1:
+        port = argv[1]
+    ngl = ""
+    if len(argv) > 2:
+        ngl = argv[2]
+    r = find_row(name)
+    if r is None:
+        print("UNKNOWN_MODEL", name)
+        return 1
+    if health(port):
+        print("ALIVE", port, models_id(port))
+        return 0
+    log = STATE + "/" + name + ".log"
+    cmd = [LLAMA, "serve", "-m", r[1], "--alias", name, "-c", "8192", "-fa", "on", "--host", "127.0.0.1", "--port", port, "--jinja"]
+    if r[2] == "oracle":
+        cmd = cmd + ["--chat-template-file", ORACLE_TPL, "--reasoning-format", "none"]
+    if ngl != "":
+        cmd = cmd + ["-ngl", ngl]
+    lf = open(log, "w")
+    p = subprocess.Popen(cmd, stdout=lf, stderr=lf, start_new_session=True)
+    open(STATE + "/" + name + ".pid", "w").write(str(p.pid))
+    n = 0
+    while n < 120:
+        if health(port):
+            print("STARTED", name, "pid", p.pid, "port", port, models_id(port))
+            return 0
+        if p.poll() is not None:
+            print("DIED rc", p.returncode)
+            print(open(log).read()[-800:])
+            return 1
+        time.sleep(3)
+        n = n + 1
+    print("TIMEOUT")
+    return 1
+
+def cmd_stop(argv):
+    name = argv[0]
+    f = STATE + "/" + name + ".pid"
+    if not os.path.exists(f):
+        print("NO_PID", name)
+        return 1
+    pid = int(open(f).read().strip())
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    os.remove(f)
+    print("STOPPED", name, pid)
+    return 0
+
+def cmd_ps(argv):
+    for f in sorted(glob.glob(STATE + "/*.pid")):
+        name = os.path.basename(f)[:-4]
+        pid = open(f).read().strip()
+        alive = "yes"
+        try:
+            os.kill(int(pid), 0)
+        except Exception:
+            alive = "no"
+        print(name, "pid", pid, "process", alive)
+    for port in ["8080", "8081"]:
+        print("port", port, "health", health(port), models_id(port))
+    return 0
+
+def cmd_list(argv):
+    for r in rows():
+        print(r[0], r[2], r[3], r[4], "file", os.path.exists(r[1]))
+    return 0
+
+def cmd_logs(argv):
+    p = STATE + "/" + argv[0] + ".log"
+    if not os.path.exists(p):
+        print("NO_LOG", argv[0])
+        return 1
+    sys.stdout.write("\n".join(open(p).read().splitlines()[-25:]) + "\n")
+    return 0
+
+def main():
+    ensure()
+    if len(sys.argv) < 2:
+        print("khz pull <owner/repo[:quant]> <name> [oracle|builtin]")
+        print("khz list")
+        print("khz run <name> [port] [ngl]")
+        print("khz stop <name>")
+        print("khz ps")
+        print("khz logs <name>")
+        return 2
+    c = sys.argv[1]
+    a = sys.argv[2:]
+    if c == "pull":
+        return cmd_pull(a)
+    if c == "list":
+        return cmd_list(a)
+    if c == "run":
+        return cmd_run(a)
+    if c == "stop":
+        return cmd_stop(a)
+    if c == "ps":
+        return cmd_ps(a)
+    if c == "logs":
+        return cmd_logs(a)
+    print("UNKNOWN_COMMAND", c)
+    return 2
+
+sys.exit(main())
