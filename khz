@@ -1,36 +1,158 @@
 #!/usr/bin/env python3
 import os, sys, glob, json, time, signal, subprocess, urllib.request
+import re, tempfile
+from pathlib import Path
 
-HOME = "/home/a"
-LLAMA = HOME + "/.local/bin/llama"
+HOME = os.path.abspath(os.environ.get("KHZ_HOME", str(Path.home())))
+LLAMA = os.environ.get("KHZ_LLAMA", HOME + "/.local/bin/llama")
 MODELS = HOME + "/models"
 STATE = HOME + "/khz"
 REG = STATE + "/models.tsv"
-ORACLE_TPL = HOME + "/oracle/oracle.jinja"
+ORACLE_TPL = os.environ.get("KHZ_TEMPLATE", HOME + "/oracle/oracle.jinja")
+START_TIMEOUT = 360
+STOP_TIMEOUT = 3
 
 def ensure():
     os.makedirs(MODELS, exist_ok=True)
     os.makedirs(STATE, exist_ok=True)
     if not os.path.exists(REG):
-        open(REG, "w").close()
+        open(REG, "a").close()
 
 def rows():
     ensure()
     out = []
-    for line in open(REG).read().splitlines():
+    for line in Path(REG).read_text(encoding="utf-8").splitlines():
         if line.strip() == "":
             continue
         p = line.split("\t")
-        while len(p) < 5:
-            p.append("")
-        out.append(p[:5])
+        if len(p) != 5 or not p[4].isdigit():
+            raise ValueError("invalid model registry row")
+        alias(p[0])
+        out.append(p)
     return out
 
+def atomic_text(path, text):
+    fd, temp = tempfile.mkstemp(prefix=".khz-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
 def write_rows(rs):
-    f = open(REG, "w")
-    for r in rs:
-        f.write("\t".join(r) + "\n")
-    f.close()
+    atomic_text(REG, "".join("\t".join(r) + "\n" for r in rs))
+
+def alias(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+        raise ValueError("name must use 1-64 letters, digits, hyphens or underscores")
+    return name
+
+def port_number(value):
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return str(port)
+
+def select_cached(spec):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", spec):
+        raise ValueError("expected owner/repo[:quant]")
+    repo, _, quant = spec.partition(":")
+    directory = Path(HOME) / ".cache/huggingface/hub" / ("models--" + repo.replace("/", "--"))
+    ref = directory / "refs/main"
+    if ref.is_file():
+        revision = ref.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+            raise ValueError("invalid cached main revision")
+        candidates = list((directory / "snapshots" / revision).glob("*.gguf"))
+    else:
+        candidates = list(directory.glob("snapshots/*/*.gguf"))
+    if quant:
+        tag = re.compile(r"(?:^|[._-])" + re.escape(quant) + r"(?=[._-]|$)", re.I)
+        candidates = [f for f in candidates if tag.search(f.name)]
+    if any(re.search(r"-\d+-of-\d+\.gguf$", f.name, re.I) for f in candidates):
+        raise ValueError("split GGUF requires an explicit shard-aware loader; no file selected")
+    candidates = sorted({str(f.resolve(strict=True)) for f in candidates})
+    if len(candidates) != 1:
+        raise ValueError("expected one exact cached GGUF, found %d; specify quant/revision" % len(candidates))
+    src = candidates[0]
+    with open(src, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("selected file is not GGUF")
+    return src
+
+def replace_link(src, dst):
+    # Never remove a unique old weight file. A prior managed link can be replaced.
+    if os.path.lexists(dst) and not os.path.islink(dst):
+        if not os.path.isfile(dst) or os.stat(dst).st_nlink < 2:
+            if os.path.isfile(dst) and os.path.samefile(src, dst):
+                return "existing"
+            raise ValueError("destination contains a unique file; move it explicitly before replacing")
+    temp = dst + ".new-" + str(os.getpid())
+    if os.path.lexists(temp):
+        raise ValueError("staging link already exists")
+    try:
+        try:
+            os.link(src, temp)
+            kind = "hardlink"
+        except OSError:
+            os.symlink(src, temp)
+            kind = "symlink"
+        os.replace(temp, dst)
+        return kind
+    finally:
+        if os.path.lexists(temp):
+            os.unlink(temp)
+
+def process_identity(pid):
+    # Linux /proc start ticks and boot id prevent trusting a reused numeric PID.
+    try:
+        raw = Path("/proc/%d/stat" % pid).read_text()
+        parts = raw[raw.rfind(")") + 2:].split()
+        if parts[0] == "Z":
+            return None
+        return {"pid": pid, "start": parts[19], "group": int(parts[2]),
+                "session": int(parts[3]), "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+    except FileNotFoundError:
+        return None
+
+def still_owned(identity):
+    return process_identity(identity["pid"]) == identity
+
+def stop_owned(identity):
+    pid = identity["pid"]
+    if pid <= 1 or identity["group"] != pid or identity["session"] != pid:
+        raise ValueError("refusing to signal an unowned process group")
+    current = process_identity(pid)
+    if current is None:
+        # Only clean metadata once no live process remains in the old group.
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                other = process_identity(int(entry.name))
+                if other and other["group"] == pid and other["session"] == pid:
+                    raise RuntimeError("group member remains; state retained")
+        return
+    if current != identity:
+        raise ValueError("PID identity changed; refusing to signal")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not still_owned(identity):
+            break
+        os.killpg(pid, sig)
+        deadline = time.monotonic() + STOP_TIMEOUT
+        while still_owned(identity) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    if still_owned(identity):
+        raise RuntimeError("owned process did not stop")
+    # Do not report the entire group stopped if a live descendant remains.
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            other = process_identity(int(entry.name))
+            if other and other["group"] == pid and other["session"] == pid:
+                raise RuntimeError("process-group member remains; state retained for review")
+
 
 def find_row(name):
     for r in rows():
@@ -53,108 +175,118 @@ def models_id(port):
         return ""
 
 def cmd_pull(argv):
-    spec = argv[0]
-    name = argv[1]
-    tpl = "builtin"
-    if len(argv) > 2:
-        tpl = argv[2]
+    spec, name = argv[:2]
+    alias(name)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", spec):
+        raise ValueError("expected owner/repo[:quant]")
+    tpl = argv[2] if len(argv) > 2 else "builtin"
+    if tpl not in {"builtin", "oracle"}:
+        raise ValueError("template must be builtin or oracle")
     rc = subprocess.call([LLAMA, "download", "-hf", spec])
     if rc != 0:
-        rc = subprocess.call([LLAMA, "download", spec])
-    print("DOWNLOAD_RC", rc)
-    if rc != 0:
+        print("DOWNLOAD_FAILED", rc)
         return 1
-    parts = spec.split(":")[0].split("/")
-    d = HOME + "/.cache/huggingface/hub/models--" + parts[0] + "--" + parts[1]
-    cands = glob.glob(d + "/snapshots/*/*.gguf")
-    if len(cands) == 0:
-        print("NO_GGUF", d)
-        return 1
-    cands.sort(key=lambda p: os.path.getsize(os.path.realpath(p)))
-    src = os.path.realpath(cands[-1])
-    dst = MODELS + "/" + name + ".gguf"
-    if os.path.exists(dst) or os.path.islink(dst):
-        os.remove(dst)
-    try:
-        os.link(src, dst)
-        kind = "hardlink"
-    except OSError:
-        os.symlink(src, dst)
-        kind = "symlink"
+    src = select_cached(spec)
+    dst = os.path.join(MODELS, name + ".gguf")
     rs = [r for r in rows() if r[0] != name]
+    kind = replace_link(src, dst)
+    # Link and registry are separately atomic, not a crash-atomic transaction.
+    # run checks the stored size; any failed registry write is reported, not hidden.
     rs.append([name, dst, tpl, spec, str(os.path.getsize(src))])
     write_rows(rs)
     print("REGISTERED", name, kind, os.path.getsize(src))
     return 0
 
 def cmd_run(argv):
-    name = argv[0]
-    port = "8080"
-    if len(argv) > 1:
-        port = argv[1]
-    ngl = ""
-    if len(argv) > 2:
-        ngl = argv[2]
+    name = alias(argv[0])
+    port = port_number(argv[1] if len(argv) > 1 else "8080")
+    ngl = str(int(argv[2])) if len(argv) > 2 else ""
     r = find_row(name)
     if r is None:
-        print("UNKNOWN_MODEL", name)
-        return 1
+        raise ValueError("UNKNOWN_MODEL " + name)
+    expected_path = os.path.join(MODELS, name + ".gguf")
+    if os.path.abspath(r[1]) != os.path.abspath(expected_path):
+        raise ValueError("registry path does not match the model alias")
+    if not os.path.isfile(r[1]) or os.path.getsize(r[1]) != int(r[4]):
+        raise ValueError("model file missing or size differs from registry")
     if health(port):
-        print("ALIVE", port, models_id(port))
+        served = models_id(port).split(",")
+        if name not in served:
+            raise ValueError("PORT_MODEL_MISMATCH " + ",".join(served))
+        print("ALIVE", name, port, "server-reported model id matched; not a generation test")
         return 0
-    log = STATE + "/" + name + ".log"
+    pid_file = os.path.join(STATE, name + ".pid")
+    if os.path.lexists(pid_file):
+        raise ValueError("process state already exists; inspect khz ps / khz stop before restarting")
+    if not Path("/proc/sys/kernel/random/boot_id").is_file():
+        raise RuntimeError("managed serving requires Linux / WSL")
+    if r[2] not in {"builtin", "oracle"}:
+        raise ValueError("invalid registry template")
+    if r[2] == "oracle" and not os.path.isfile(ORACLE_TPL):
+        raise ValueError("oracle template missing")
+    log = os.path.join(STATE, name + ".log")
     cmd = [LLAMA, "serve", "-m", r[1], "--alias", name, "-c", "8192", "-fa", "on", "--host", "127.0.0.1", "--port", port, "--jinja"]
     if r[2] == "oracle":
-        cmd = cmd + ["--chat-template-file", ORACLE_TPL, "--reasoning-format", "none"]
-    if ngl != "":
-        cmd = cmd + ["-ngl", ngl]
-    lf = open(log, "w")
-    p = subprocess.Popen(cmd, stdout=lf, stderr=lf, start_new_session=True)
-    open(STATE + "/" + name + ".pid", "w").write(str(p.pid))
-    n = 0
-    while n < 120:
-        if health(port):
-            print("STARTED", name, "pid", p.pid, "port", port, models_id(port))
-            return 0
-        if p.poll() is not None:
-            print("DIED rc", p.returncode)
-            print(open(log).read()[-800:])
-            return 1
-        time.sleep(3)
-        n = n + 1
-    print("TIMEOUT")
-    return 1
+        cmd += ["--chat-template-file", ORACLE_TPL, "--reasoning-format", "none"]
+    if ngl:
+        cmd += ["-ngl", ngl]
+    with open(log, "a", encoding="utf-8") as lf:
+        p = subprocess.Popen(cmd, stdout=lf, stderr=lf, start_new_session=True)
+    identity = None
+    ready = False
+    try:
+        identity = process_identity(p.pid)
+        if identity is None:
+            raise RuntimeError("server exited before process registration")
+        atomic_text(pid_file, json.dumps({"identity": identity, "model": name, "port": port}) + "\n")
+        deadline = time.monotonic() + START_TIMEOUT
+        while time.monotonic() < deadline:
+            if p.poll() is not None:
+                raise RuntimeError("SERVER_DIED exit=" + str(p.returncode))
+            if health(port):
+                if name not in models_id(port).split(","):
+                    raise ValueError("PORT_MODEL_MISMATCH during startup")
+                if not still_owned(identity):
+                    raise RuntimeError("server process identity changed during startup")
+                ready = True
+                print("STARTED", name, "pid", p.pid, "port", port)
+                return 0
+            time.sleep(0.2)
+        raise TimeoutError("server startup timed out")
+    finally:
+        if not ready:
+            if identity is not None:
+                stop_owned(identity)
+            else:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=STOP_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+            p.wait(timeout=STOP_TIMEOUT)
+            if os.path.isfile(pid_file):
+                os.unlink(pid_file)
 
 def cmd_stop(argv):
-    name = argv[0]
-    f = STATE + "/" + name + ".pid"
-    if not os.path.exists(f):
-        print("NO_PID", name)
-        return 1
-    pid = int(open(f).read().strip())
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
-    os.remove(f)
-    print("STOPPED", name, pid)
+    name = alias(argv[0])
+    path = os.path.join(STATE, name + ".pid")
+    record = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or record.get("model") != name or not isinstance(record.get("identity"), dict):
+        raise ValueError("legacy or invalid PID state; no process will be signalled")
+    stop_owned(record["identity"])
+    os.unlink(path)
+    print("STOPPED", name, record["identity"]["pid"])
     return 0
 
 def cmd_ps(argv):
     for f in sorted(glob.glob(STATE + "/*.pid")):
-        name = os.path.basename(f)[:-4]
-        pid = open(f).read().strip()
-        alive = "yes"
         try:
-            os.kill(int(pid), 0)
-        except Exception:
-            alive = "no"
-        print(name, "pid", pid, "process", alive)
-    for port in ["8080", "8081"]:
-        print("port", port, "health", health(port), models_id(port))
+            record = json.loads(Path(f).read_text(encoding="utf-8"))
+            state = "owned-alive" if still_owned(record["identity"]) else "stale-or-exited"
+        except (ValueError, KeyError, TypeError, OSError):
+            state = "unverified-legacy-state"
+        print(Path(f).stem, state)
     return 0
 
 def cmd_list(argv):
@@ -163,38 +295,38 @@ def cmd_list(argv):
     return 0
 
 def cmd_logs(argv):
-    p = STATE + "/" + argv[0] + ".log"
+    p = STATE + "/" + alias(argv[0]) + ".log"
     if not os.path.exists(p):
         print("NO_LOG", argv[0])
         return 1
     sys.stdout.write("\n".join(open(p).read().splitlines()[-25:]) + "\n")
     return 0
 
-def main():
-    ensure()
-    if len(sys.argv) < 2:
-        print("khz pull <owner/repo[:quant]> <name> [oracle|builtin]")
-        print("khz list")
-        print("khz run <name> [port] [ngl]")
-        print("khz stop <name>")
-        print("khz ps")
-        print("khz logs <name>")
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    commands = {"pull": (cmd_pull, 2, 3), "run": (cmd_run, 1, 3), "stop": (cmd_stop, 1, 1),
+                "list": (cmd_list, 0, 0), "ps": (cmd_ps, 0, 0), "logs": (cmd_logs, 1, 1)}
+    if not argv or argv[0] in {"--help", "-h"}:
+        print("khz pull owner/repo[:quant] name [oracle|builtin] | run name [port] [ngl] | stop name | list | ps | logs name")
+        return 0 if argv else 2
+    if argv[0] not in commands:
+        print("UNKNOWN_COMMAND", argv[0], file=sys.stderr)
         return 2
-    c = sys.argv[1]
-    a = sys.argv[2:]
-    if c == "pull":
-        return cmd_pull(a)
-    if c == "list":
-        return cmd_list(a)
-    if c == "run":
-        return cmd_run(a)
-    if c == "stop":
-        return cmd_stop(a)
-    if c == "ps":
-        return cmd_ps(a)
-    if c == "logs":
-        return cmd_logs(a)
-    print("UNKNOWN_COMMAND", c)
-    return 2
+    fn, minimum, maximum = commands[argv[0]]
+    args = argv[1:]
+    if not minimum <= len(args) <= maximum:
+        print("INVALID_ARGUMENT_COUNT", argv[0], file=sys.stderr)
+        return 2
+    try:
+        # All CLI commands serialize registry/process changes. No daemon needed.
+        import fcntl
+        ensure()
+        with open(os.path.join(STATE, ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fn(args)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, ImportError, subprocess.SubprocessError) as error:
+        print("ERROR", str(error), file=sys.stderr)
+        return 1
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
