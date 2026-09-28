@@ -16,7 +16,7 @@ def ensure():
     os.makedirs(MODELS, exist_ok=True)
     os.makedirs(STATE, exist_ok=True)
     if not os.path.exists(REG):
-        open(REG, "w").close()
+        open(REG, "a").close()
 
 def rows():
     ensure()

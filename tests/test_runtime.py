@@ -150,6 +150,12 @@ class RuntimeTests(unittest.TestCase):
         for args in [["pull"], ["run"], ["stop"], ["logs"], ["list", "extra"]]:
             self.assertEqual(khz.main(args), 2)
 
+    def test_initialization_race_never_truncates_registry(self):
+        self.register(); before = Path(khz.REG).read_bytes()
+        with patch.object(khz.os.path, "exists", return_value=False):
+            khz.ensure()
+        self.assertEqual(Path(khz.REG).read_bytes(), before)
+
     def test_ports_validate_range(self):
         for port in ["0", "65536", "bad"]:
             with self.assertRaises(ValueError): khz.port_number(port)
