@@ -186,13 +186,14 @@ def cmd_pull(argv):
     tpl = argv[2] if len(argv) > 2 else "builtin"
     if tpl not in {"builtin", "oracle"}:
         raise ValueError("template must be builtin or oracle")
+    # Validate the existing registry before any network/download side effect.
+    rs = [r for r in rows() if r[0] != name]
     rc = subprocess.call([LLAMA, "download", "-hf", spec])
     if rc != 0:
         print("DOWNLOAD_FAILED", rc)
         return 1
     src = select_cached(spec)
     dst = os.path.join(MODELS, name + ".gguf")
-    rs = [r for r in rows() if r[0] != name]
     kind = replace_link(src, dst)
     # Link and registry are separately atomic, not a crash-atomic transaction.
     # run checks the stored size; any failed registry write is reported, not hidden.
