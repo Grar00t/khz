@@ -21,6 +21,7 @@ def ensure():
 def rows():
     ensure()
     out = []
+    seen = set()
     for line in Path(REG).read_text(encoding="utf-8").splitlines():
         if line.strip() == "":
             continue
@@ -28,6 +29,9 @@ def rows():
         if len(p) != 5 or not p[4].isdigit():
             raise ValueError("invalid model registry row")
         alias(p[0])
+        if p[0] in seen:
+            raise ValueError("duplicate model registry alias: " + p[0])
+        seen.add(p[0])
         out.append(p)
     return out
 

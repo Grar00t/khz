@@ -3,7 +3,7 @@
 The existing CLI is repaired in place; no model weights are supplied or renamed by installation.
 
 - Exact quantization-tag selection, cached main revision when available, and ambiguity/split-file rejection replace largest-file selection.
-- Alias validation prevents names from escaping the models/state directories.
+- Alias validation prevents names from escaping the models/state directories; duplicate registry aliases fail closed instead of resolving by row order.
 - Replacement stages a link before atomic rename and refuses to replace a unique existing weight file.
 - Registry writes are atomic; registry and link are not a crash-atomic pair. Report any registry write error before reuse.
 - A healthy port must also report the requested model id. This is service metadata, not proof of model quality or a cryptographic weight identity.

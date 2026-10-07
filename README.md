@@ -44,6 +44,8 @@ The third `pull` argument selects the chat template. `oracle` forces `oracle.jin
 name    path    template    spec    bytes
 ```
 
+Model aliases are unique. A malformed registry or duplicate alias fails closed instead of choosing one row implicitly.
+
 ## Runtime persona and model provenance
 
 `oracle.jinja` replaces the vendor chat template at inference time when the operator explicitly selects the `oracle` mode. It names the local runtime persona **Oracle**, but it does **not** replace the provenance of the loaded GGUF weights.
