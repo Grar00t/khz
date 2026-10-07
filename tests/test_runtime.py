@@ -147,6 +147,10 @@ class RuntimeTests(unittest.TestCase):
         Path(khz.REG).write_text(row + "\n" + row + "\n", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "duplicate model registry alias"):
             khz.rows()
+        with patch.object(khz.subprocess, "call") as download:
+            self.assertEqual(khz.main(["pull", "owner/repo:Q4_K_M", "other"]), 1)
+            download.assert_not_called()
+
     def test_registry_write_failure_preserves_original_index(self):
         self.register(); before = Path(khz.REG).read_bytes()
         with patch.object(khz.os, "replace", side_effect=OSError("fixture")):
