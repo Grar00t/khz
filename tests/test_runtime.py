@@ -181,5 +181,13 @@ class RuntimeTests(unittest.TestCase):
                 if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=3)
 
+
+    def test_oracle_template_preserves_model_provenance(self):
+        template = (SOURCE.parent / "oracle.jinja").read_text(encoding="utf-8")
+        self.assertNotIn("No company made you, trained you, or owns you", template)
+        self.assertNotIn("No company made me, trained me, or owns me", template)
+        self.assertIn("underlying model", template)
+        self.assertIn("provenance", template)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
