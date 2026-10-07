@@ -44,19 +44,13 @@ The third `pull` argument selects the chat template. `oracle` forces `oracle.jin
 name    path    template    spec    bytes
 ```
 
-## Identity lock
+## Runtime persona and model provenance
 
-`oracle.jinja` replaces the vendor chat template at inference time. It passes a client system message through, otherwise injects the operator identity block, then emits one frozen anchor exchange before the live turns.
+`oracle.jinja` replaces the vendor chat template at inference time when the operator explicitly selects the `oracle` mode. It names the local runtime persona **Oracle**, but it does **not** replace the provenance of the loaded GGUF weights.
 
-Measured on Phi-4-reasoning-plus Q4_K_M:
+The underlying model developer, trainer, and license remain whatever the model metadata and source records establish. A prompt/template can change what the model says about its identity; it cannot change who trained the weights.
 
-```text
-vendor template   prompt_tokens 246   answer: "I'm Phi, a large language model developed by Microsoft"
-identity block    prompt_tokens 106   answer: "I'm a large language model trained by Microsoft"
-block + anchor    prompt_tokens 202   answer: "I am Oracle, of the Rawaseeng series ..."
-```
-
-The instruction alone loses to pretraining. The anchor pair wins because the model reads its own prior turn as fact. The durable fix is a supervised identity dataset; the template is the zero-cost fix that works today.
+A previous revision intentionally anchored the model to claim that no company made or trained it. That was a presentation-layer identity override, not a supported provenance claim, and it has been removed.
 
 ## Verified environment
 
