@@ -140,6 +140,17 @@ class RuntimeTests(unittest.TestCase):
             kill.assert_not_called()
         self.assertTrue(target.exists())
 
+    def test_duplicate_registry_alias_is_rejected(self):
+        path = Path(khz.MODELS) / "demo.gguf"
+        path.write_bytes(b"GGUFtest")
+        row = "\t".join(["demo", str(path), "builtin", "owner/repo:Q4_K_M", str(path.stat().st_size)])
+        Path(khz.REG).write_text(row + "\n" + row + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "duplicate model registry alias"):
+            khz.rows()
+        with patch.object(khz.subprocess, "call") as download:
+            self.assertEqual(khz.main(["pull", "owner/repo:Q4_K_M", "other"]), 1)
+            download.assert_not_called()
+
     def test_registry_write_failure_preserves_original_index(self):
         self.register(); before = Path(khz.REG).read_bytes()
         with patch.object(khz.os, "replace", side_effect=OSError("fixture")):
